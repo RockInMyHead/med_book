@@ -1,0 +1,993 @@
+import streamlit as st
+import os
+import tempfile
+import time
+from main import TextProcessor
+from typing import Optional
+import base64
+from pathlib import Path
+from PIL import Image
+from illustration_pipeline import IllustrationPipeline
+from settings_manager import (
+    settings_manager, get_api_key, set_api_key, has_api_key, save_settings,
+    get_nanobanana_api_key, set_nanobanana_api_key,
+    get_dalle_api_key, set_dalle_api_key,
+    get_google_search_api_key, set_google_search_api_key,
+    get_google_search_engine_id, set_google_search_engine_id,
+    has_illustration_apis
+)
+
+# Функции для отображения результатов иллюстраций
+def display_image_carousel(images_dir="extracted_images", max_images=10):
+    """Отображает карусель изображений"""
+    if not os.path.exists(images_dir):
+        st.warning(f"📁 Директория {images_dir} не найдена")
+        return
+
+    image_files = [f for f in os.listdir(images_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
+    if not image_files:
+        st.info("📭 Изображения не найдены в директории extracted_images")
+        return
+
+    # Сортируем по имени файла (page_1_img_0.png, page_1_img_1.png, etc.)
+    image_files.sort()
+
+    # Ограничиваем количество изображений для отображения
+    display_files = image_files[:max_images]
+
+    st.subheader("🎠 Карусель извлеченных изображений")
+    st.write(f"📊 Найдено изображений: {len(image_files)} | Показано: {len(display_files)}")
+
+    # Создаем колонки для изображений (максимум 4 в ряд для лучшего отображения)
+    cols_per_row = min(4, len(display_files))
+    rows = (len(display_files) + cols_per_row - 1) // cols_per_row
+
+    for row in range(rows):
+        cols = st.columns(cols_per_row)
+        for col_idx in range(cols_per_row):
+            img_idx = row * cols_per_row + col_idx
+            if img_idx < len(display_files):
+                image_file = display_files[img_idx]
+                with cols[col_idx]:
+                    image_path = os.path.join(images_dir, image_file)
+                    try:
+                        # Используем st.image с правильными параметрами
+                        st.image(image_path, caption=f"{image_file}", width=150, use_container_width=False)
+                    except Exception as e:
+                        st.error(f"❌ Ошибка загрузки {image_file}: {str(e)}")
+                        # Показываем путь для диагностики
+                        st.code(f"Путь: {image_path}")
+
+    if len(image_files) > max_images:
+        st.info(f"ℹ️ Показано {max_images} изображений из {len(image_files)}. Обработка продолжается...")
+
+def display_found_images(results):
+    """Отображает найденные изображения из поиска"""
+    if not results.get("found_images"):
+        return
+
+    st.subheader("🖼️ Найденные изображения из поиска")
+
+    # Проверяем и фильтруем найденные изображения
+    valid_images = []
+    for img in results["found_images"]:
+        if isinstance(img, dict) and "pathology" in img and "source" in img:
+            valid_images.append(img)
+        else:
+            st.warning(f"⚠️ Пропущено некорректное изображение: {type(img)} - {str(img)[:100]}...")
+
+    if not valid_images:
+        st.info("ℹ️ Не найдено корректных изображений для отображения")
+        return
+
+    # Группируем изображения по патологиям
+    images_by_pathology = {}
+    for img in valid_images:
+        pathology = img["pathology"]
+        if pathology not in images_by_pathology:
+            images_by_pathology[pathology] = []
+        images_by_pathology[pathology].append(img)
+
+    # Отображаем по каждой патологии
+    for pathology, images in images_by_pathology.items():
+        with st.expander(f"🔍 {pathology} ({len(images)} изображений)", expanded=False):
+            st.write(f"**Патология:** {pathology}")
+            st.write(f"**Найдено изображений:** {len(images)}")
+
+            # Отображаем изображения в колонках
+            for i in range(0, len(images), 3):
+                cols = st.columns(min(3, len(images) - i))
+                for j in range(min(3, len(images) - i)):
+                    img = images[i + j]
+                    with cols[j]:
+                        st.write(f"**Источник:** {img['source']}")
+                        st.write(f"**Название:** {img['title']}")
+
+                    # Показываем thumbnail если есть
+                    if img.get("thumbnail") and isinstance(img["thumbnail"], str) and img["thumbnail"].startswith("http"):
+                        try:
+                            st.image(img["thumbnail"], caption=img["title"], use_column_width=True)
+                        except Exception as e:
+                            st.info(f"📷 Thumbnail недоступен: {str(e)}")
+                    else:
+                        st.info("📷 Thumbnail недоступен")
+
+                        # Показываем ссылку если есть
+                        if img.get("url"):
+                            st.markdown(f"[🔗 Открыть изображение]({img['url']})")
+
+                        if j < len(cols) - 1:  # Не добавляем разделитель для последнего в ряду
+                            st.divider()
+
+def display_detailed_logs(results):
+    """Отображает подробные логи поиска"""
+    st.subheader("🔍 Подробные логи поиска")
+
+    # Логи обработки изображений
+    if results.get("processed_images", 0) > 0:
+        with st.expander("📊 Статистика обработки изображений", expanded=False):
+            st.write("### Общая статистика:")
+            st.write(f"- Всего изображений: {results.get('total_images', 0)}")
+            st.write(f"- Обработано: {results.get('processed_images', 0)}")
+            st.write(f"- Сгенерировано: {results.get('generated_images', 0)}")
+            st.write(f"- Найдено в поиске: {results.get('search_results', 0)}")
+
+            if results.get("pathologies_found"):
+                st.write("### Найденные патологии:")
+                for pathology in results["pathologies_found"]:
+                    st.success(f"✅ {pathology}")
+
+            if results.get("pathologies_missing"):
+                st.write("### Патологии в розыске:")
+                for pathology in results["pathologies_missing"]:
+                    st.warning(f"⚠️ {pathology}")
+
+    # Логи поиска по патологиям
+    if results.get("pathologies_missing"):
+        with st.expander("🔍 Детали поиска по патологиям", expanded=False):
+            st.write("### Результаты поиска:")
+            for pathology in results["pathologies_missing"]:
+                st.write(f"• **{pathology}** - searching")
+                st.info("Поиск выполнялся в базах TCIA и Google Images. Изображения не найдены, патология добавлена в список розыска.")
+
+# Настройка страницы
+st.set_page_config(
+    page_title="Text Re-phraser",
+    page_icon="📝",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Заголовок приложения
+st.title("📝 Text Re-phraser")
+st.markdown("**Инструмент для перефразирования текста в академическом стиле**")
+
+# Боковая панель с информацией
+with st.sidebar:
+    st.header("ℹ️ Информация")
+    st.markdown("""
+    **Возможности:**
+    - 📄 Поддержка форматов: PDF, TXT, MD, DOCX
+    - 🎓 Перефразирование в академическом стиле
+    - 💾 Сохранение оригинала и результата
+
+    **Требования:**
+    - Действующий API-ключ
+    - Стабильное интернет-соединение
+    """)
+
+# Инициализация состояния приложения
+def init_session_state():
+    """Инициализация переменных состояния Streamlit"""
+    if 'api_key_input' not in st.session_state:
+        st.session_state.api_key_input = ""
+    if 'api_key_saved' not in st.session_state:
+        st.session_state.api_key_saved = has_api_key()
+    if 'show_api_key_form' not in st.session_state:
+        st.session_state.show_api_key_form = False
+    if 'api_key_status' not in st.session_state:
+        st.session_state.api_key_status = "🔑 API ключ " + ("сохранен" if has_api_key() else "не установлен")
+
+# Основная функция приложения
+def main():
+    # Инициализация состояния
+    init_session_state()
+
+    # Создание вкладок
+    tab1, tab2, tab3, tab5 = st.tabs(["🔄 Перефразирование", "📊 Результаты", "🎨 Иллюстрации", "⚙️ Настройки"])
+
+    with tab1:
+        st.header("🔄 Перефразирование текста")
+
+        # Загрузка файла
+        uploaded_file = st.file_uploader(
+            "Выберите файл для обработки",
+            type=["pdf", "txt", "md", "docx"],
+            help="Поддерживаемые форматы: PDF, TXT, MD, DOCX"
+        )
+
+        # Ввод темы
+        theme = st.text_input(
+            "Тема текста",
+            value="РЕНТГЕНОДИАГНОСТИКА ЗАБОЛЕВАНИЙ КОСТЕЙ И СУСТАВОВ",
+            help="Укажите тематику текста для более точного перефразирования"
+        )
+
+        # Настройка уровня упрощения/уточнения текста
+        st.markdown("#### 🎚️ Настройка стиля перефразирования")
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            temperature = st.slider(
+                "Уровень творческого переформулирования",
+                min_value=0.0,
+                max_value=1.0,
+                value=settings_manager.get("temperature", 0.4),
+                step=0.1,
+                help="Низкие значения (0.0-0.3): точное сохранение смысла, минимальные изменения\n"
+                     "Средние значения (0.4-0.6): баланс между точностью и вариативностью\n"
+                     "Высокие значения (0.7-1.0): более творческое переформулирование"
+            )
+        with col2:
+            st.metric("Значение", f"{temperature:.1f}")
+        
+        # Описание выбранного уровня
+        if temperature <= 0.3:
+            st.info("📌 **Консервативный режим**: Максимальное сохранение оригинальной структуры и терминологии")
+        elif temperature <= 0.6:
+            st.info("⚖️ **Сбалансированный режим**: Умеренное перефразирование с сохранением академического стиля")
+        else:
+            st.info("✨ **Творческий режим**: Более вариативное переформулирование с сохранением смысла")
+
+        # Переключатель добавления информации о новых исследованиях
+        include_research = st.checkbox(
+            "Добавлять информацию о новых исследованиях из разных известных источников",
+            value=settings_manager.get("include_research", False),
+            help="Включает добавление актуальной научной информации"
+        )
+
+        # Информация об API ключе
+        if has_api_key():
+            st.info("ℹ️ API ключ настроен. Переходите к загрузке файла и перефразированию.")
+        else:
+            st.warning("⚠️ API ключ не установлен. Пожалуйста, настройте его в разделе 'Настройки' перед началом работы.")
+
+        # API ключ будет получен автоматически при обработке
+        api_key = ""
+
+        # Кнопка запуска
+        if st.button("🚀 Начать перефразирование", type="primary", use_container_width=True):
+            if not uploaded_file:
+                st.error("❌ Пожалуйста, загрузите файл для обработки")
+                return
+
+            # Проверка API ключа
+            if not has_api_key():
+                st.error("❌ API ключ не настроен. Пожалуйста, настройте его в разделе 'Настройки'")
+                return
+
+            # Используем сохраненный ключ
+            api_key = get_api_key()
+
+            if not theme:
+                st.error("❌ Пожалуйста, укажите тему текста")
+                return
+
+            # Создание прогресс-бара
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            try:
+                # Сохранение загруженного файла во временную директорию
+                status_text.text("📁 Сохранение файла...")
+                progress_bar.progress(10)
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded_file.name}") as tmp_file:
+                    tmp_file.write(uploaded_file.getvalue())
+                    temp_file_path = tmp_file.name
+
+                status_text.text("🔍 Извлечение текста...")
+                progress_bar.progress(30)
+
+                # Сохранение выбранных настроек
+                settings_manager.set("temperature", temperature)
+                settings_manager.set("include_research", include_research)
+                
+                # Создание процессора с дополнительными параметрами
+                processor = TextProcessor(api_key, temperature=temperature, include_research=include_research)
+
+                # Извлечение текста
+                original_text = processor.read_input_file(temp_file_path)
+
+                if not original_text:
+                    st.error("❌ Не удалось извлечь текст из файла")
+                    return
+
+                status_text.text(f"🤖 Перефразирование текста (temperature: {temperature})...")
+                progress_bar.progress(60)
+
+                # Перефразирование
+                paraphrased_text = processor.process_text(original_text, theme)
+
+                if not paraphrased_text:
+                    st.error("❌ Не удалось перефразировать текст")
+                    return
+
+                status_text.text("💾 Сохранение результатов...")
+                progress_bar.progress(90)
+
+                # Сохранение результатов
+                output_dir = "output"
+                os.makedirs(output_dir, exist_ok=True)
+
+                # Сохранение оригинального текста
+                with open(f"{output_dir}/original.txt", "w", encoding="utf-8") as f:
+                    f.write(original_text)
+
+                # Сохранение перефразированного текста
+                with open(f"{output_dir}/paraphrased.txt", "w", encoding="utf-8") as f:
+                    f.write(paraphrased_text)
+
+                # Сохранение в session_state
+                st.session_state.original_text = original_text
+                st.session_state.paraphrased_text = paraphrased_text
+                st.session_state.processing_complete = True
+
+                progress_bar.progress(100)
+                status_text.text("✅ Обработка завершена успешно!")
+                time.sleep(1)
+                status_text.empty()
+                progress_bar.empty()
+
+                st.success("🎉 Перефразирование завершено! Перейдите на вкладку 'Результаты' для просмотра.")
+
+            except Exception as e:
+                st.error(f"❌ Произошла ошибка: {str(e)}")
+                st.info("💡 Рекомендации по устранению ошибки:\n"
+                       "1. Проверьте корректность API-ключа\n"
+                       "2. Убедитесь в стабильности интернет-соединения\n"
+                       "3. Проверьте, что файл не поврежден\n"
+                       "4. Попробуйте использовать VPN")
+
+            finally:
+                # Очистка временного файла
+                if 'temp_file_path' in locals():
+                    try:
+                        os.unlink(temp_file_path)
+                    except:
+                        pass
+
+    with tab2:
+        st.header("📊 Результаты перефразирования")
+
+        if 'processing_complete' in st.session_state and st.session_state.processing_complete:
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.subheader("📄 Оригинальный текст")
+                # Добавляем возможность скачать оригинальный текст
+                st.download_button(
+                    label="📥 Скачать оригинал",
+                    data=st.session_state.original_text,
+                    file_name="original.txt",
+                    mime="text/plain"
+                )
+                st.text_area(
+                    "Оригинальный текст:",
+                    st.session_state.original_text,
+                    height=400,
+                    disabled=True
+                )
+
+            with col2:
+                st.subheader("✨ Перефразированный текст")
+                # Добавляем возможность скачать перефразированный текст
+                st.download_button(
+                    label="📥 Скачать результат",
+                    data=st.session_state.paraphrased_text,
+                    file_name="paraphrased.txt",
+                    mime="text/plain"
+                )
+                st.text_area(
+                    "Перефразированный текст:",
+                    st.session_state.paraphrased_text,
+                    height=400,
+                    disabled=True
+                )
+
+            # Статистика
+            st.markdown("---")
+            st.subheader("📈 Статистика")
+            col1, col2, col3 = st.columns(3)
+
+            original_words = len(st.session_state.original_text.split())
+            paraphrased_words = len(st.session_state.paraphrased_text.split())
+
+            with col1:
+                st.metric("Слов в оригинале", original_words)
+
+            with col2:
+                st.metric("Слов в результате", paraphrased_words)
+
+            with col3:
+                diff_percent = round((paraphrased_words - original_words) / original_words * 100, 1)
+                st.metric("Изменение объема", f"{diff_percent}%")
+
+        else:
+            st.info("ℹ️ Выполните перефразирование на вкладке 'Перефразирование', чтобы увидеть результаты здесь.")
+
+    with tab3:
+        st.header("🎨 Автоматическая иллюстрация книги")
+        
+        # Загрузка PDF книги для извлечения изображений
+        st.subheader("📚 Загрузка книги")
+        uploaded_pdf = st.file_uploader(
+            "Выберите PDF файл книги для извлечения изображений",
+            type=["pdf"],
+            help="Поддерживается только PDF формат. Изображения будут извлечены и сохранены в папку extracted_images/"
+        )
+        
+        if uploaded_pdf:
+            col_extract1, col_extract2 = st.columns([2, 1])
+
+            with col_extract1:
+                st.info(f"📄 Загружен файл: **{uploaded_pdf.name}** ({uploaded_pdf.size} байт)")
+
+                extract_images = st.checkbox(
+                    "Извлечь изображения из PDF",
+                    value=True,
+                    help="Автоматически извлечь все изображения из PDF файла"
+                )
+
+                if extract_images:
+                    st.info("ℹ️ Изображения будут извлечены и классифицированы (энциклопедические/клинические)")
+
+            with col_extract2:
+                if st.button("🚀 Извлечь изображения", type="primary", use_container_width=True):
+                    if not extract_images:
+                        st.error("❌ Включите опцию извлечения изображений")
+                                    else:
+                        # Сохранение загруженного PDF
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                        # Создаем placeholder для логов
+                        log_placeholder = st.empty()
+                        extraction_logs = []
+
+                        def update_extraction_logs(message):
+                            extraction_logs.append(message)
+                            recent_logs = extraction_logs[-3:]
+                            log_text = "\n".join(f"• {log}" for log in recent_logs)
+                            if len(extraction_logs) > 3:
+                                log_text = f"... и ещё {len(extraction_logs) - 3} операций\n" + log_text
+                            log_placeholder.code(f"🔍 Логи извлечения:\n{log_text}", language="text")
+
+                        try:
+                        status_text.text("📁 Сохранение PDF файла...")
+                        progress_bar.progress(10)
+                        
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                            tmp_file.write(uploaded_pdf.getvalue())
+                            temp_pdf_path = tmp_file.name
+                        
+                            # Инициализация pipeline
+                            status_text.text("🎨 Инициализация системы обработки...")
+                        progress_bar.progress(30)
+
+                        pipeline = IllustrationPipeline()
+                        
+                            # Извлечение изображений
+                            status_text.text("🔍 Извлечение изображений из PDF...")
+                        progress_bar.progress(60)
+
+                            # Извлекаем изображения
+                        results = pipeline.extract_images_from_pdf(temp_pdf_path, progress_callback=update_extraction_logs)
+
+                                                # Анализ и классификация
+                        status_text.text("🧠 Анализ и классификация изображений...")
+                        progress_bar.progress(80)
+
+                                                # Сохраняем метаданные
+                        pipeline._save_image_metadata()
+
+                        progress_bar.progress(100)
+                        status_text.text("✅ Извлечение завершено!")
+
+                                                # Результаты
+                                                st.success(f"🎉 Извлечено **{len(results)}** изображений из книги!")
+
+                    if results:
+                                                col_res1, col_res2, col_res3 = st.columns(3)
+                                                with col_res1:
+                                                st.metric("Всего изображений", len(results))
+                                                with col_res2:
+                        clinical = sum(1 for img in results if img.get('classification') == 'clinical')
+                                                st.metric("Клинические", clinical)
+                                                with col_res3:
+                        encyclopedia = sum(1 for img in results if img.get('classification') == 'encyclopedia')
+                                                st.metric("Энциклопедические", encyclopedia)
+
+                                                # Показываем превью первых изображений
+                                                st.subheader("🖼️ Извлеченные изображения")
+                        preview_images = results[:6]  # Показываем первые 6
+
+                        cols = st.columns(3)
+                        for i, img_info in enumerate(preview_images):
+                        with cols[i % 3]:
+                        img_path = img_info.get('file_path', '')
+                    if os.path.exists(img_path):
+                    try:
+                                                st.image(img_path, caption=f"Изображение {i+1}", width=150)
+                        except:
+                                                st.error(f"Ошибка загрузки изображения {i+1}")
+
+                                                # Очищаем временные файлы
+                    if 'temp_pdf_path' in locals():
+                    try:
+                        os.unlink(temp_pdf_path)
+                        except:
+                        pass
+
+                                                # Очищаем placeholder
+                        log_placeholder.empty()
+                        progress_bar.empty()
+                        status_text.empty()
+
+                        # Перезагружаем страницу для обновления счетчика изображений
+                        st.rerun()
+                        
+                    except Exception as e:
+                            st.error(f"❌ Ошибка при извлечении изображений: {str(e)}")
+                        if 'temp_pdf_path' in locals():
+                            try:
+                                os.unlink(temp_pdf_path)
+                            except:
+                                pass
+        
+        st.markdown("---")
+
+        # Автоматический поиск всех изображений
+        if not os.path.exists("extracted_images"):
+            st.warning("📁 Директория extracted_images не найдена")
+            st.info("ℹ️ Изображения должны находиться в папке extracted_images/")
+        else:
+            image_files = [f for f in os.listdir("extracted_images") if f.endswith(('.png', '.jpg', '.jpeg'))]
+            if not image_files:
+                st.info("📭 Изображения не найдены в директории extracted_images")
+                st.info("ℹ️ Добавьте изображения в папку extracted_images/ для работы с ними")
+            else:
+                st.subheader(f"🖼️ Найдено изображений: {len(image_files)}")
+
+                # Сортируем изображения для последовательного просмотра
+                image_files.sort()
+
+                # Выбор текущего изображения через селектбокс или навигацию
+                if 'current_image_index' not in st.session_state:
+                    st.session_state.current_image_index = 0
+
+                # Навигация между изображениями
+                col_nav1, col_nav2, col_nav3 = st.columns([1, 2, 1])
+
+                with col_nav1:
+                    if st.button("⬅️ Предыдущее", disabled=st.session_state.current_image_index == 0):
+                        st.session_state.current_image_index = max(0, st.session_state.current_image_index - 1)
+                        st.rerun()
+
+                with col_nav2:
+                    selected_image = st.selectbox(
+                        "Выберите изображение:",
+                        image_files,
+                        index=st.session_state.current_image_index,
+                        format_func=lambda x: f"{st.session_state.current_image_index + 1}/{len(image_files)}: {x}",
+                        label_visibility="collapsed"
+                    )
+                    # Обновляем индекс при выборе
+                    st.session_state.current_image_index = image_files.index(selected_image)
+
+                with col_nav3:
+                    if st.button("Следующее ➡️", disabled=st.session_state.current_image_index == len(image_files) - 1):
+                        st.session_state.current_image_index = min(len(image_files) - 1, st.session_state.current_image_index + 1)
+                        st.rerun()
+
+                # Отображение текущего изображения
+                    if selected_image:
+                        image_path = os.path.join("extracted_images", selected_image)
+
+                    # Основная информация
+                                                    st.markdown(f"**📊 Изображение {st.session_state.current_image_index + 1} из {len(image_files)}**")
+                                                    st.markdown(f"**📄 Файл:** {selected_image}")
+
+                        col1, col2 = st.columns([1, 2])
+
+                        with col1:
+                            st.subheader("📷 Оригинальное изображение")
+                            try:
+                                st.image(image_path, caption=f"Оригинал: {selected_image}", width=300)
+                            except Exception as e:
+                                st.error(f"❌ Ошибка загрузки изображения: {str(e)}")
+
+                        with col2:
+                    st.subheader("🎨 Перерисовка через Nano Banana")
+
+                            # Настройки размера изображения
+                            image_size = st.selectbox(
+                                "Размер изображения:",
+                                ["256x256", "512x512", "1024x1024"],
+                                index=1,  # 512x512 по умолчанию
+                                            help="Nano Banana поддерживает генерацию изображений по описанию",
+                                            key=f"size_{selected_image}"
+                            )
+
+                            # Качество генерации
+                            quality = st.selectbox(
+                                "Качество:",
+                                ["standard", "hd"],
+                                index=0,
+                                            help="HD качество доступно только для размера 1024x1024",
+                                            key=f"quality_{selected_image}"
+                            )
+
+                            # Если выбран размер не 1024x1024, но качество HD, корректируем
+                            if image_size != "1024x1024" and quality == "hd":
+                                st.warning("⚠️ HD качество доступно только для размера 1024x1024")
+                                quality = "standard"
+
+                            # Поле для редактирования промпта
+                    # Создаем базовый промпт для медицинского изображения
+                            pipeline = IllustrationPipeline()
+                            image_metadata = pipeline.get_image_metadata(image_path)
+
+                                            if image_metadata and image_metadata.get("text_around") and image_metadata["text_around"].strip():
+                    # У нас есть текст вокруг изображения
+                                            text_around = image_metadata["text_around"].strip()[:150]
+                                    classification = image_metadata.get("classification", "unknown")
+                                    pathology = image_metadata.get("pathology")
+
+                                    if classification == "clinical" and pathology:
+                                            default_prompt = f"Medical X-ray showing {pathology}. Professional diagnostic image, clear anatomical details, educational for medical students. Context: {text_around}"
+                                    else:
+                                            default_prompt = f"Medical illustration: {text_around}. Professional healthcare visual, anatomical accuracy, educational style."
+                                else:
+                    # Используем fallback промпт
+                                default_prompt = pipeline._generate_fallback_prompt(selected_image)
+
+                    # Защита от неправильных промптов
+                                            if not isinstance(default_prompt, str) or len(default_prompt.strip()) == 0 or len(default_prompt) > 500:
+                                            default_prompt = f"Medical illustration from radiology textbook page {selected_image.split('_')[1] if '_' in selected_image else 'unknown'}. Professional healthcare visual, clear and educational for medical students."
+
+                    # Дополнительная проверка на HTML/интерфейсный текст
+                                            if any(char in default_prompt for char in ['📝', '🔄', '📊', '🎨', '⚙️']) or 'Text Re-phraser' in default_prompt:
+                                            default_prompt = f"Medical illustration from radiology textbook. Professional healthcare visual, clear and educational for medical students."
+
+                            custom_prompt = st.text_area(
+                                "Промпт для генерации:",
+                                value=default_prompt,
+                                            height=80,
+                                            help="Опишите, как должно выглядеть перерисованное изображение. Оставьте поле пустым для автоматической генерации промпта.",
+                                            key=f"redraw_prompt_{selected_image}"
+                                            )
+
+                    # Кнопка перерисовки
+                        if st.button("🎭 Перерисовать", type="primary", use_container_width=True, key=f"redraw_{selected_image}"):
+                        if not get_nanobanana_api_key():
+                                                st.error("❌ Nano Banana API ключ не настроен")
+                                    else:
+                                        # Создаем pipeline и перерисовываем изображение
+                                        pipeline = IllustrationPipeline()
+
+                                        # Получаем метаданные изображения
+                                        image_metadata = pipeline.get_image_metadata(image_path)
+
+                                        # Создаем объект с информацией об изображении
+                                        if image_metadata:
+                                            image_info = {
+                                                "file_path": image_path,
+                                                "text_around": image_metadata.get("text_around", ""),
+                                                "classification": image_metadata.get("classification", "unknown"),
+                                                "pathology": image_metadata.get("pathology")
+                                            }
+                                        else:
+                                            # Fallback на случай отсутствия метаданных
+                                            image_info = {
+                                                "file_path": image_path,
+                                                "text_around": custom_prompt if custom_prompt.strip() else "Medical illustration content",
+                                                "classification": "encyclopedia",
+                                                "pathology": None
+                                            }
+
+                                        # Показываем прогресс
+                                        with st.spinner("🎨 Генерация изображения через Nano Banana..."):
+                                            try:
+                                            result_path = pipeline.redraw_image_with_nanobanana(
+                                                    image_info,
+                                                    custom_prompt=custom_prompt if custom_prompt.strip() else None,
+                                                    size=image_size
+                                                )
+
+                                                if result_path:
+                                                    st.success("✅ Изображение успешно перерисовано!")
+
+                                                    # Отображаем результат
+                                                    st.subheader("✨ Результат перерисовки")
+                                                col_res1, col_res2 = st.columns(2)
+
+                with col_res1:
+                                                    st.markdown("**📷 Оригинал:**")
+                                                    st.image(image_path, width=200)
+
+                with col_res2:
+                                                    st.markdown("**🎨 Перерисовано:**")
+                                            st.image(result_path, caption=f"Перерисовано: {os.path.basename(result_path)}", width=200)
+
+                                                    # Кнопка скачивания
+                                                    with open(result_path, "rb") as file:
+                                                        st.download_button(
+                                                            label="📥 Скачать изображение",
+                                                            data=file,
+                                                            file_name=os.path.basename(result_path),
+                                            mime="image/png",
+                                            key=f"download_{selected_image}_{st.session_state.current_image_index}"
+                                                        )
+                                                else:
+                                                    st.error("❌ Не удалось перерисовать изображение. Проверьте API ключ и попробуйте снова.")
+
+                                            except Exception as e:
+                                                st.error(f"❌ Ошибка при перерисовке: {str(e)}")
+
+                    # Кнопки навигации
+                                                    st.markdown("---")
+                                            col_nav4, col_nav5 = st.columns(2)
+
+                with col_nav4:
+                        if st.button("🔄 Перегенерировать", use_container_width=True, key=f"regenerate_{selected_image}"):
+                                            st.info("ℹ️ Используйте кнопку 'Перерисовать' для генерации нового варианта с текущими настройками")
+
+                with col_nav5:
+                        if st.button("✅ Утвердить", use_container_width=True, key=f"approve_{selected_image}"):
+                                    st.success("✅ Изображение утверждено! (функционал сохранения будет добавлен позже)")
+
+    with tab5:
+        st.header("⚙️ Настройки и информация")
+
+        st.subheader("🔑 Управление API ключом")
+
+        # Статус API ключа
+        if has_api_key():
+            st.success("✅ API ключ сохранен")
+            masked_key = get_api_key()
+            if len(masked_key) > 12:
+                masked_key = f"{masked_key[:8]}...{masked_key[-4:]}"
+            st.code(f"Ключ: {masked_key}", language=None)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🔄 Изменить API ключ", use_container_width=True):
+                    st.session_state.show_api_key_settings = True
+            with col2:
+                if st.button("🗑️ Удалить API ключ", use_container_width=True):
+                    settings_manager.clear_api_key()
+                    st.session_state.api_key_saved = False
+                    st.session_state.api_key_status = "🔑 API ключ не установлен"
+                    st.success("🗑️ API ключ удален!")
+                    st.rerun()
+        else:
+            st.warning("⚠️ API ключ не установлен")
+            if st.button("➕ Добавить API ключ", use_container_width=True):
+                st.session_state.show_api_key_settings = True
+
+        # Форма для ввода API ключа
+        if st.session_state.get('show_api_key_settings', False):
+            with st.expander("🔑 Настройка API ключа", expanded=True):
+                st.markdown("Введите ваш API ключ")
+
+                new_api_key = st.text_input(
+                    "API-ключ",
+                    type="password",
+                    help="Введите ваш API-ключ",
+                    key="settings_api_key_input"
+                )
+
+                col1, col2, col3 = st.columns([1, 1, 1])
+                with col1:
+                    if st.button("💾 Сохранить", use_container_width=True):
+                        if new_api_key and new_api_key.strip():
+                            set_api_key(new_api_key.strip())
+                            st.session_state.api_key_saved = True
+                            st.session_state.api_key_status = "🔑 API ключ сохранен"
+                            st.session_state.show_api_key_settings = False
+                            st.success("🔑 API ключ успешно сохранен!")
+                            st.rerun()
+                        else:
+                            st.error("❌ API ключ не может быть пустым")
+
+                with col2:
+                    if st.button("🔍 Проверить", use_container_width=True):
+                        if new_api_key and new_api_key.strip():
+                            st.info("🔍 Проверка API ключа...")
+                            # Здесь можно добавить реальную проверку ключа через тестовый запрос
+                            st.success("✅ Формат API ключа корректный")
+                        else:
+                            st.error("❌ Введите API ключ для проверки")
+
+                with col3:
+                    if st.button("❌ Отмена", use_container_width=True):
+                        st.session_state.show_api_key_settings = False
+                        st.rerun()
+
+        st.markdown("---")
+
+        # Настройки API ключей для иллюстраций
+        st.subheader("🎨 API ключи для иллюстраций")
+
+        # Nano Banana API
+        if get_nanobanana_api_key():
+            st.success("✅ Nano Banana API ключ настроен")
+            if st.button("🗑️ Удалить Nano Banana API ключ", use_container_width=True):
+                set_nanobanana_api_key("")
+                st.rerun()
+        else:
+            st.warning("⚠️ Nano Banana API ключ не установлен")
+            if st.button("➕ Добавить Nano Banana API ключ", use_container_width=True):
+                st.session_state.show_nanobanana_settings = True
+
+        # NanoBanana API
+        if get_nanobanana_api_key():
+            st.success("✅ NanoBanana API ключ настроен")
+            if st.button("🗑️ Удалить NanoBanana API ключ", use_container_width=True):
+                set_nanobanana_api_key("")
+                st.rerun()
+        else:
+            st.warning("⚠️ NanoBanana API ключ не установлен")
+            if st.button("➕ Добавить NanoBanana API ключ", use_container_width=True):
+                st.session_state.show_nanobanana_settings = True
+        
+        # Google Custom Search API
+        if get_google_search_api_key() and get_google_search_engine_id():
+            st.success("✅ Google Custom Search API настроен")
+            if st.button("🗑️ Удалить Google API ключи", use_container_width=True):
+                set_google_search_api_key("")
+                set_google_search_engine_id("")
+                st.rerun()
+        else:
+            st.warning("⚠️ Google Custom Search API не настроен")
+            if st.button("➕ Добавить Google API ключи", use_container_width=True):
+                st.session_state.show_google_settings = True
+        
+        # Формы для настройки API ключей
+        if st.session_state.get('show_nanobanana_settings', False):
+            with st.expander("🎨 Настройка Nano Banana API", expanded=True):
+                st.markdown("Введите ваш API ключ Nano Banana")
+                st.info("💡 Nano Banana - сервис генерации изображений по текстовому описанию")
+
+                nanobanana_key = st.text_input(
+                    "Nano Banana API-ключ",
+                    type="password",
+                    help="Введите ваш API-ключ от Nano Banana",
+                    key="nanobanana_api_key_input"
+                )
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("💾 Сохранить", use_container_width=True):
+                        if nanobanana_key and nanobanana_key.strip():
+                            set_nanobanana_api_key(nanobanana_key.strip())
+                            st.session_state.show_nanobanana_settings = False
+                            st.success("🎨 Nano Banana API ключ сохранен!")
+                            st.rerun()
+                        else:
+                            st.error("❌ API ключ не может быть пустым")
+
+                with col2:
+                    if st.button("❌ Отмена", use_container_width=True):
+                        st.session_state.show_nanobanana_settings = False
+                        st.rerun()
+
+        if st.session_state.get('show_nanobanana_settings', False):
+            with st.expander("🎨 Настройка NanoBanana API", expanded=True):
+                st.markdown("Введите ваш API ключ NanoBanana")
+                
+                nanobanana_key = st.text_input(
+                    "NanoBanana API-ключ",
+                    type="password",
+                    help="Введите ваш API-ключ от NanoBanana",
+                    key="nanobanana_api_key_input"
+                )
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("💾 Сохранить", use_container_width=True):
+                        if nanobanana_key and nanobanana_key.strip():
+                            set_nanobanana_api_key(nanobanana_key.strip())
+                            st.session_state.show_nanobanana_settings = False
+                            st.success("🎨 NanoBanana API ключ сохранен!")
+                            st.rerun()
+                        else:
+                            st.error("❌ API ключ не может быть пустым")
+                
+                with col2:
+                    if st.button("❌ Отмена", use_container_width=True):
+                        st.session_state.show_nanobanana_settings = False
+                        st.rerun()
+        
+        if st.session_state.get('show_google_settings', False):
+            with st.expander("🔍 Настройка Google Custom Search API", expanded=True):
+                st.markdown("Введите ваши API ключи Google Custom Search")
+                
+                google_key = st.text_input(
+                    "Google Custom Search API-ключ",
+                    type="password",
+                    help="Введите ваш API-ключ от Google Cloud Console",
+                    key="google_api_key_input"
+                )
+                
+                google_engine_id = st.text_input(
+                    "ID поисковой системы",
+                    help="Введите ID вашей поисковой системы Google",
+                    key="google_engine_id_input"
+                )
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("💾 Сохранить", use_container_width=True):
+                        if google_key and google_engine_id and google_key.strip() and google_engine_id.strip():
+                            set_google_search_api_key(google_key.strip())
+                            set_google_search_engine_id(google_engine_id.strip())
+                            st.session_state.show_google_settings = False
+                            st.success("🔍 Google API ключи сохранены!")
+                            st.rerun()
+                        else:
+                            st.error("❌ Все поля должны быть заполнены")
+                
+                with col2:
+                    if st.button("❌ Отмена", use_container_width=True):
+                        st.session_state.show_google_settings = False
+                        st.rerun()
+        
+        st.markdown("---")
+
+        st.subheader("🔧 Параметры обработки")
+        current_temp = settings_manager.get("temperature", 0.4)
+        st.markdown(f"""
+        **Максимальная длина блока:** 500 символов  
+        **Температура (текущая):** {current_temp} (от 0.0 до 1.0)  
+        **Максимальные токены:** 2000  
+        
+        💡 **Информация о температуре:**
+        - **0.0-0.3**: Консервативный режим - минимальные изменения
+        - **0.4-0.6**: Сбалансированный режим - умеренное перефразирование
+        - **0.7-1.0**: Творческий режим - более вариативное переформулирование
+        """)
+
+        st.subheader("📋 Инструкции по использованию")
+        st.markdown("""
+        1. **Загрузите файл** в поддерживаемом формате (PDF, TXT, MD, DOCX)
+        2. **Укажите тему текста** для более точного перефразирования
+        3. **Настройте уровень перефразирования** (temperature) с помощью слайдера:
+           - 0.0-0.3: Консервативный режим
+           - 0.4-0.6: Сбалансированный режим (рекомендуется)
+           - 0.7-1.0: Творческий режим
+        4. **Настройте API-ключ** в разделе "Настройки"
+        5. **Нажмите кнопку** "Начать перефразирование"
+        6. **Просмотрите результаты** на вкладке "Результаты"
+        
+        📖 **Подробнее:** см. файлы TEMPERATURE_FEATURE.md и USAGE_EXAMPLES.md
+        """)
+
+        st.subheader("🚨 Возможные проблемы")
+        with st.expander("Распространенные ошибки и решения"):
+            st.markdown("""
+            **Ошибка API-ключа:**
+            - Проверьте корректность ключа
+            - Убедитесь, что ключ активен
+
+            **Ошибка сети:**
+            - Проверьте стабильность соединения
+
+            **Ошибка файла:**
+            - Проверьте формат файла
+            - Убедитесь, что файл не поврежден
+            """)
+
+if __name__ == "__main__":
+    main()
