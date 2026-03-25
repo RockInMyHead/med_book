@@ -2227,6 +2227,13 @@ html,body{{background:#ffffff!important;color:#1e293b!important;margin:0;padding
                                         original_text=None,
                                         paraphrased_text=article_text,
                                         created_by=st.session_state.get("username", "admin"),
+                                        style_science=int(settings_manager.get("style_science", 3)),
+                                        style_depth=int(settings_manager.get("style_depth", 3)),
+                                        style_accuracy=int(settings_manager.get("style_accuracy", 3)),
+                                        style_readability=int(settings_manager.get("style_readability", 3)),
+                                        style_source_quality=int(
+                                            settings_manager.get("style_source_quality", 3)
+                                        ),
                                     )
                                     mark_article_saved(hist_id, book_id)
                                     st.session_state.last_saved_book_id = book_id
@@ -2367,7 +2374,8 @@ html,body{{background:#ffffff!important;color:#1e293b!important;margin:0;padding
                 for fig_num in _find_figure_refs_in_block(paraphrased_block):
                     if fig_num - 1 < len(image_paths):
                         img_path = image_paths[fig_num - 1]
-                        block_with_images += f"\n\n![Рисунок {fig_num}]({img_path})\n\n"
+                        p_norm = os.path.abspath(img_path).replace("\\", "/")
+                        block_with_images += f"\n\n![Рисунок {fig_num}](file:{p_norm})\n\n"
                     else:
                         block_with_images += f"\n\n![Рисунок {fig_num}]\n\n"
 
@@ -2485,6 +2493,7 @@ html,body{{background:#ffffff!important;color:#1e293b!important;margin:0;padding
                 theme=theme,
                 temperature=temperature,
                 include_research=include_research,
+                style_controls=style_controls,
             )
             
             # Устанавливаем флаг завершения
@@ -2515,6 +2524,7 @@ html,body{{background:#ffffff!important;color:#1e293b!important;margin:0;padding
                         temperature=temperature,
                         include_research=include_research,
                         save_to_db=True,
+                        style_controls=style_controls,
                     )
                     st.warning("Обработка прервана. Частичные результаты сохранены в файлы и добавлены в список книг — проверьте вкладку «Результаты».")
                 except Exception:
@@ -2533,9 +2543,21 @@ html,body{{background:#ffffff!important;color:#1e293b!important;margin:0;padding
                 except:
                     pass
 
-    def _save_results(self, original_text, paraphrased_text, *, source_filename, theme, temperature, include_research, save_to_db=True):
+    def _save_results(
+        self,
+        original_text,
+        paraphrased_text,
+        *,
+        source_filename,
+        theme,
+        temperature,
+        include_research,
+        save_to_db=True,
+        style_controls=None,
+    ):
         """Сохранение результатов обработки.
         save_to_db: при False только файлы (для частичных результатов при прерывании).
+        style_controls: как при генерации (science, depth, …) — пишутся в книгу для дефолтов перегенерации.
         """
         output_dir = "output"
         os.makedirs(output_dir, exist_ok=True)
@@ -2557,6 +2579,7 @@ html,body{{background:#ffffff!important;color:#1e293b!important;margin:0;padding
         if save_to_db and st.session_state.get("user_role") == "admin":
             try:
                 title = (source_filename or "").strip() or "Переписанная книга"
+                sc = style_controls or {}
                 book_id = create_book(
                     title=title,
                     source_filename=source_filename,
@@ -2566,6 +2589,13 @@ html,body{{background:#ffffff!important;color:#1e293b!important;margin:0;padding
                     original_text=original_text,
                     paraphrased_text=paraphrased_text,
                     created_by=st.session_state.get("username", "admin"),
+                    style_science=int(sc.get("science", settings_manager.get("style_science", 3))),
+                    style_depth=int(sc.get("depth", settings_manager.get("style_depth", 3))),
+                    style_accuracy=int(sc.get("accuracy", settings_manager.get("style_accuracy", 3))),
+                    style_readability=int(sc.get("readability", settings_manager.get("style_readability", 3))),
+                    style_source_quality=int(
+                        sc.get("source_quality", settings_manager.get("style_source_quality", 3))
+                    ),
                 )
                 st.session_state.last_saved_book_id = book_id
                 st.success(f"Сохранено в БД (книга #{book_id}).")

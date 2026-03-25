@@ -120,6 +120,21 @@ def init_db() -> None:
             );
             """
         )
+        _migrate_books_style_columns(conn)
+
+
+def _migrate_books_style_columns(conn: sqlite3.Connection) -> None:
+    for col, decl in (
+        ("style_science", "INTEGER"),
+        ("style_depth", "INTEGER"),
+        ("style_accuracy", "INTEGER"),
+        ("style_readability", "INTEGER"),
+        ("style_source_quality", "INTEGER"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE books ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError:
+            pass
 
 
 @contextmanager
@@ -143,14 +158,37 @@ def create_book(
     original_text: str | None,
     paraphrased_text: str,
     created_by: str,
+    style_science: int | None = None,
+    style_depth: int | None = None,
+    style_accuracy: int | None = None,
+    style_readability: int | None = None,
+    style_source_quality: int | None = None,
 ) -> int:
+    from settings_manager import settings_manager
+
     title = (title or "").strip() or "Без названия"
     created_by = (created_by or "").strip() or "unknown"
+
+    def _iv(val: int | None, key: str, lo: int, hi: int, default: int) -> int:
+        if val is not None:
+            return max(lo, min(hi, int(val)))
+        return max(lo, min(hi, int(settings_manager.get(key, default))))
+
+    ss = _iv(style_science, "style_science", 1, 5, 3)
+    sd = _iv(style_depth, "style_depth", 1, 5, 3)
+    sa = _iv(style_accuracy, "style_accuracy", 1, 5, 3)
+    sr = _iv(style_readability, "style_readability", 1, 7, 3)
+    sq = _iv(style_source_quality, "style_source_quality", 1, 5, 3)
+
     with db() as conn:
         cur = conn.execute(
             """
-            INSERT INTO books (title, source_filename, theme, temperature, include_research, original_text, paraphrased_text, created_at, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO books (
+              title, source_filename, theme, temperature, include_research,
+              original_text, paraphrased_text, created_at, created_by,
+              style_science, style_depth, style_accuracy, style_readability, style_source_quality
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 title,
@@ -162,6 +200,11 @@ def create_book(
                 paraphrased_text,
                 _now_iso(),
                 created_by,
+                ss,
+                sd,
+                sa,
+                sr,
+                sq,
             ),
         )
         book_id = int(cur.lastrowid)

@@ -823,8 +823,7 @@ class TextProcessor:
         if style_controls:
             old = self.style_controls
             self.style_controls = style_controls
-        if custom_prompt and custom_prompt.strip():
-            self._custom_regen_prompt = custom_prompt.strip()
+        self._custom_regen_prompt = (custom_prompt or "").strip()
         chunks = self.split_block_tokens(block, max_tokens=MAX_CHUNK_LENGTH, overlap_tokens=50)
         if not chunks:
             return block

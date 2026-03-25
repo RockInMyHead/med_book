@@ -43,6 +43,10 @@ def _fmt_dt(value: str) -> str:
         return value or ""
 
 
+def _paragraph_blocks(text: str) -> list[str]:
+    return [b.strip() for b in (text or "").split("\n\n") if b.strip()]
+
+
 class BooksTab:
     def render(self, tab):
         with tab:
@@ -104,63 +108,84 @@ class BooksTab:
         st.subheader("Доступ модераторов")
 
         moderators = list_moderators()
-        if not moderators:
-            st.info("Нет модераторов. Создайте их во вкладке «Модераторы».")
-            return
-
-        all_usernames = [m.username for m in moderators]
-        current = set(list_book_access(book_id))
-
-        selected = st.multiselect(
-            "Выдать доступ модераторам",
-            options=all_usernames,
-            default=[u for u in all_usernames if u in current],
+        book_body = book.get("paraphrased_text", "") or ""
+        dl_kwargs = dict(
+            label="Скачать переписанный текст",
+            data=book_body,
+            file_name=f"book_{book_id}_paraphrased.txt",
+            mime="text/plain",
+            width="stretch",
         )
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Сохранить доступ", type="primary", width="stretch"):
-                desired = set(selected)
-                to_add = sorted(desired - current)
-                to_remove = sorted(current - desired)
-                try:
-                    for u in to_add:
-                        grant_access(
-                            book_id=book_id,
-                            moderator_username=u,
-                            granted_by=st.session_state.get("username", "admin"),
-                        )
-                    for u in to_remove:
-                        revoke_access(book_id=book_id, moderator_username=u)
-                    st.success("Доступ обновлён.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Не удалось обновить доступ: {e}")
-
-        with col2:
-            st.download_button(
-                "Скачать переписанный текст",
-                data=book.get("paraphrased_text", "") or "",
-                file_name=f"book_{book_id}_paraphrased.txt",
-                mime="text/plain",
-                width="stretch",
+        if not moderators:
+            st.info(
+                "Нет модераторов. Создайте их во вкладке «Модераторы». "
+                "Редактирование книги и комментарии ниже доступны всегда."
             )
+            st.download_button(**dl_kwargs)
+        else:
+            all_usernames = [m.username for m in moderators]
+            current = set(list_book_access(book_id))
+
+            selected = st.multiselect(
+                "Выдать доступ модераторам",
+                options=all_usernames,
+                default=[u for u in all_usernames if u in current],
+            )
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Сохранить доступ", type="primary", width="stretch"):
+                    desired = set(selected)
+                    to_add = sorted(desired - current)
+                    to_remove = sorted(current - desired)
+                    try:
+                        for u in to_add:
+                            grant_access(
+                                book_id=book_id,
+                                moderator_username=u,
+                                granted_by=st.session_state.get("username", "admin"),
+                            )
+                        for u in to_remove:
+                            revoke_access(book_id=book_id, moderator_username=u)
+                        st.success("Доступ обновлён.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Не удалось обновить доступ: {e}")
+
+            with col2:
+                st.download_button(**dl_kwargs)
 
         st.markdown("---")
         self._render_versions(book_id, book, st.session_state.get("username", "admin"))
 
         st.markdown("---")
-        with st.expander("Просмотр (переписанный текст)", expanded=False):
-            st.text_area(
-                "Переписанный текст",
-                value=book.get("paraphrased_text", "") or "",
-                height=420,
-                disabled=True,
-                key=f"admin_view_{book_id}",
-            )
+        st.subheader("Редактирование и перегенерация (администратор)")
+        adm_user = st.session_state.get("username", "admin")
+        edit_key_adm = f"adm_edit_{book_id}"
+        edited_adm = st.text_area(
+            "Текст книги (можно редактировать)",
+            value=book.get("paraphrased_text", "") or "",
+            height=320,
+            key=edit_key_adm,
+        )
+        if st.button("Сохранить правки", key=f"adm_save_{book_id}", width="stretch"):
+            try:
+                update_book_paraphrased(
+                    book_id,
+                    edited_adm,
+                    change_note="Редактирование администратором",
+                    created_by=adm_user,
+                )
+                st.success("Правки сохранены.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Не удалось сохранить: {e}")
+
+        self._render_paragraph_regen_ui(book_id, book, edited_adm, adm_user, key_prefix="adm")
+        self._render_fragment_regen_ui(book_id, book, edited_adm, adm_user, key_prefix="adm")
 
         st.markdown("---")
-        self._render_admin_comments(book_id)
+        self._render_admin_comments(book_id, edited_adm)
 
     def _render_moderator(self):
         username = st.session_state.get("username", "")
@@ -216,106 +241,10 @@ class BooksTab:
             except Exception as e:
                 st.error(f"Не удалось сохранить: {e}")
 
-        # Выбор абзацев и перегенерация
         st.markdown("---")
-        st.subheader("Перегенерация абзацев")
-        blocks = [b.strip() for b in (edited_text or "").split("\n\n") if b.strip()]
-        if blocks:
-            st.caption("Отметьте абзацы для перегенерации через API.")
-            if not has_active_api_key():
-                st.warning("Настройте API-ключ (OpenAI или DeepSeek) в разделе «Настройки» для перегенерации.")
-            else:
-                selected_indices = []
-                for i, block in enumerate(blocks[:50]):
-                    short = (block[:80] + "…") if len(block) > 80 else block
-                    if st.checkbox(f"Абзац {i + 1}: {short}", key=f"mod_sel_{book_id}_{i}"):
-                        selected_indices.append(i)
-                if len(blocks) > 50:
-                    st.caption(f"Показаны первые 50 из {len(blocks)} абзацев.")
+        self._render_paragraph_regen_ui(book_id, book, edited_text, username, key_prefix="mod")
+        self._render_fragment_regen_ui(book_id, book, edited_text, username, key_prefix="mod")
 
-                if selected_indices:
-                    regen_prompt = st.text_area(
-                        "Инструкция для перегенерации (необязательно)",
-                        placeholder="Например: упростить язык, добавить примеры, убрать повторы…",
-                        height=80,
-                        key=f"mod_regen_prompt_{book_id}",
-                    )
-                    st.markdown("##### Параметры стиля")
-                    st.caption("По умолчанию — текущие настройки проекта. Измените для этой перегенерации.")
-                    rc1, rc2 = st.columns(2)
-                    with rc1:
-                        regen_science = st.select_slider(
-                            "Научность",
-                            options=[1, 2, 3, 4, 5],
-                            value=int(settings_manager.get("style_science", 3)),
-                            key=f"mod_regen_science_{book_id}",
-                        )
-                        regen_depth = st.select_slider(
-                            "Глубина",
-                            options=[1, 2, 3, 4, 5],
-                            value=int(settings_manager.get("style_depth", 3)),
-                            key=f"mod_regen_depth_{book_id}",
-                        )
-                    with rc2:
-                        regen_readability = st.select_slider(
-                            "Читаемость",
-                            options=[1, 2, 3, 4, 5, 6, 7],
-                            value=min(7, max(1, int(settings_manager.get("style_readability", 3)))),
-                            key=f"mod_regen_readability_{book_id}",
-                        )
-                        regen_accuracy = st.select_slider(
-                            "Точность",
-                            options=[1, 2, 3, 4, 5],
-                            value=int(settings_manager.get("style_accuracy", 3)),
-                            key=f"mod_regen_accuracy_{book_id}",
-                        )
-
-                if selected_indices and st.button("Перегенерировать выбранные", key=f"mod_regen_{book_id}", type="primary"):
-                    theme = book.get("theme") or DEFAULT_THEME
-                    temperature = float(book.get("temperature") or settings_manager.get("temperature", 0.4))
-                    provider = get_llm_provider()
-                    api_key = (
-                        get_deepseek_api_key()
-                        if provider == "deepseek"
-                        else get_gemini_api_key()
-                        if provider == "gemini"
-                        else get_api_key()
-                    )
-                    regen_style = {
-                        "science": regen_science,
-                        "depth": regen_depth,
-                        "accuracy": regen_accuracy,
-                        "readability": regen_readability,
-                        "source_quality": int(settings_manager.get("style_source_quality", 3)),
-                    }
-                    try:
-                        processor = TextProcessor(api_key, temperature=temperature, include_research=False)
-                        new_blocks = list(blocks)
-                        with st.spinner("Перегенерация..."):
-                            for idx in selected_indices:
-                                new_blocks[idx] = processor.paraphrase_block(
-                                    blocks[idx],
-                                    theme,
-                                    idx + 1,
-                                    custom_prompt=regen_prompt or "",
-                                    style_controls=regen_style,
-                                )
-                        new_text = "\n\n".join(new_blocks)
-                        note = f"Перегенерация {len(selected_indices)} абзацев"
-                        if regen_prompt and regen_prompt.strip():
-                            note += f" (инструкция: {regen_prompt.strip()[:60]})"
-                        update_book_paraphrased(
-                            book_id,
-                            new_text,
-                            change_note=note,
-                            created_by=username,
-                        )
-                        st.success(f"Перегенерировано абзацев: {len(selected_indices)}")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Ошибка перегенерации: {e}")
-
-        # Комментарии
         st.markdown("---")
         st.subheader("Комментарии")
         comments = list_comments(book_id)
@@ -325,14 +254,15 @@ class BooksTab:
             st.markdown(c.get("comment_text", ""))
             st.markdown("---")
 
-        with st.form("add_comment_form", clear_on_submit=True):
+        self._render_paragraph_index_legend(edited_text)
+        with st.form(f"add_comment_form_{book_id}", clear_on_submit=True):
             new_comment = st.text_area("Новый комментарий", placeholder="Введите комментарий...", height=100)
             para_for_comment = st.number_input(
                 "К абзацу (0 = общий комментарий)",
                 min_value=0,
                 value=0,
                 step=1,
-                help="0 — общий комментарий к книге",
+                help="Номер см. в списке абзацев выше.",
             )
             if st.form_submit_button("Добавить комментарий"):
                 if (new_comment or "").strip():
@@ -350,7 +280,261 @@ class BooksTab:
                 else:
                     st.error("Введите текст комментария.")
 
-    def _render_admin_comments(self, book_id: int):
+    def _style_defaults_for_book(self, book: dict) -> dict:
+        """Стили при сохранении книги (колонки БД) или текущие настройки проекта."""
+
+        def one(col: str, sk: str, lo: int, hi: int, d: int) -> int:
+            v = book.get(col)
+            if v is not None:
+                try:
+                    return max(lo, min(hi, int(v)))
+                except (TypeError, ValueError):
+                    pass
+            return max(lo, min(hi, int(settings_manager.get(sk, d))))
+
+        return {
+            "science": one("style_science", "style_science", 1, 5, 3),
+            "depth": one("style_depth", "style_depth", 1, 5, 3),
+            "accuracy": one("style_accuracy", "style_accuracy", 1, 5, 3),
+            "readability": one("style_readability", "style_readability", 1, 7, 3),
+            "source_quality": one("style_source_quality", "style_source_quality", 1, 5, 3),
+        }
+
+    def _render_paragraph_regen_ui(
+        self,
+        book_id: int,
+        book: dict,
+        edited_text: str,
+        username: str,
+        key_prefix: str,
+    ) -> None:
+        st.subheader("Перегенерация абзацев")
+        blocks = _paragraph_blocks(edited_text)
+        if not blocks:
+            st.caption("Нет абзацев (пустой текст).")
+            return
+        defaults = self._style_defaults_for_book(book)
+        st.caption(
+            "Отметьте абзацы. Слайдеры стиля по умолчанию — как при сохранении книги в базу "
+            "(если записано) или из раздела «Настройки» / генерации сейчас."
+        )
+        if not has_active_api_key():
+            st.warning("Настройте API-ключ в «Настройках» для перегенерации.")
+            return
+
+        selected_indices: list[int] = []
+        for i, block in enumerate(blocks[:50]):
+            short = (block[:80] + "…") if len(block) > 80 else block
+            if st.checkbox(f"Абзац {i + 1}: {short}", key=f"{key_prefix}_sel_{book_id}_{i}"):
+                selected_indices.append(i)
+        if len(blocks) > 50:
+            st.caption(f"Показаны первые 50 из {len(blocks)} абзацев.")
+
+        regen_prompt = ""
+        regen_science = defaults["science"]
+        regen_depth = defaults["depth"]
+        regen_readability = defaults["readability"]
+        regen_accuracy = defaults["accuracy"]
+        regen_sq = defaults["source_quality"]
+
+        if selected_indices:
+            regen_prompt = st.text_area(
+                "Инструкция для перегенерации (необязательно)",
+                placeholder="Например: упростить язык, добавить примеры, убрать повторы…",
+                height=80,
+                key=f"{key_prefix}_regen_prompt_{book_id}",
+            )
+            st.markdown("##### Параметры стиля для этой перегенерации")
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                regen_science = st.select_slider(
+                    "Научность",
+                    options=[1, 2, 3, 4, 5],
+                    value=defaults["science"],
+                    key=f"{key_prefix}_regen_science_{book_id}",
+                )
+                regen_depth = st.select_slider(
+                    "Глубина",
+                    options=[1, 2, 3, 4, 5],
+                    value=defaults["depth"],
+                    key=f"{key_prefix}_regen_depth_{book_id}",
+                )
+                regen_sq = st.select_slider(
+                    "Качество источников",
+                    options=[1, 2, 3, 4, 5],
+                    value=defaults["source_quality"],
+                    key=f"{key_prefix}_regen_srcq_{book_id}",
+                )
+            with rc2:
+                regen_readability = st.select_slider(
+                    "Читаемость",
+                    options=[1, 2, 3, 4, 5, 6, 7],
+                    value=min(7, max(1, int(defaults["readability"]))),
+                    key=f"{key_prefix}_regen_readability_{book_id}",
+                )
+                regen_accuracy = st.select_slider(
+                    "Точность",
+                    options=[1, 2, 3, 4, 5],
+                    value=defaults["accuracy"],
+                    key=f"{key_prefix}_regen_accuracy_{book_id}",
+                )
+
+        if selected_indices and st.button(
+            "Перегенерировать выбранные", key=f"{key_prefix}_regen_btn_{book_id}", type="primary"
+        ):
+            theme = book.get("theme") or DEFAULT_THEME
+            temperature = float(book.get("temperature") or settings_manager.get("temperature", 0.4))
+            provider = get_llm_provider()
+            api_key = (
+                get_deepseek_api_key()
+                if provider == "deepseek"
+                else get_gemini_api_key()
+                if provider == "gemini"
+                else get_api_key()
+            )
+            regen_style = {
+                "science": regen_science,
+                "depth": regen_depth,
+                "accuracy": regen_accuracy,
+                "readability": regen_readability,
+                "source_quality": regen_sq,
+            }
+            try:
+                processor = TextProcessor(api_key, temperature=temperature, include_research=False)
+                new_blocks = list(blocks)
+                with st.spinner("Перегенерация..."):
+                    for idx in selected_indices:
+                        new_blocks[idx] = processor.paraphrase_block(
+                            blocks[idx],
+                            theme,
+                            idx + 1,
+                            custom_prompt=regen_prompt or "",
+                            style_controls=regen_style,
+                        )
+                new_text = "\n\n".join(new_blocks)
+                note = f"Перегенерация {len(selected_indices)} абзацев"
+                if regen_prompt and regen_prompt.strip():
+                    note += f" (инструкция: {regen_prompt.strip()[:60]})"
+                update_book_paraphrased(
+                    book_id,
+                    new_text,
+                    change_note=note,
+                    created_by=username,
+                )
+                st.success(f"Перегенерировано абзацев: {len(selected_indices)}")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Ошибка перегенерации: {e}")
+
+    def _render_fragment_regen_ui(
+        self,
+        book_id: int,
+        book: dict,
+        edited_text: str,
+        username: str,
+        key_prefix: str,
+    ) -> None:
+        defaults = self._style_defaults_for_book(book)
+        with st.expander("Пересоздать выделенный фрагмент (скопируйте из текста выше)", expanded=False):
+            st.caption(
+                "Вставьте **точную** подстроку из поля «Текст книги». Она должна встречаться **ровно один раз**."
+            )
+            frag = st.text_area("Фрагмент", height=100, key=f"{key_prefix}_frag_txt_{book_id}")
+            frag_instr = st.text_area(
+                "Инструкция (что исправить)",
+                height=72,
+                key=f"{key_prefix}_frag_ins_{book_id}",
+            )
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                fs = st.select_slider(
+                    "Научность", options=[1, 2, 3, 4, 5], value=defaults["science"], key=f"{key_prefix}_frag_sci_{book_id}"
+                )
+                fd = st.select_slider(
+                    "Глубина", options=[1, 2, 3, 4, 5], value=defaults["depth"], key=f"{key_prefix}_frag_dep_{book_id}"
+                )
+                fsrc = st.select_slider(
+                    "Качество источников",
+                    options=[1, 2, 3, 4, 5],
+                    value=defaults["source_quality"],
+                    key=f"{key_prefix}_frag_src_{book_id}",
+                )
+            with fc2:
+                fr = st.select_slider(
+                    "Читаемость",
+                    options=[1, 2, 3, 4, 5, 6, 7],
+                    value=min(7, max(1, int(defaults["readability"]))),
+                    key=f"{key_prefix}_frag_read_{book_id}",
+                )
+                fa = st.select_slider(
+                    "Точность", options=[1, 2, 3, 4, 5], value=defaults["accuracy"], key=f"{key_prefix}_frag_acc_{book_id}"
+                )
+
+            if st.button("Пересоздать фрагмент через LLM", key=f"{key_prefix}_frag_go_{book_id}", type="primary"):
+                raw = (edited_text or "")
+                needle = (frag or "").strip()
+                if not needle:
+                    st.error("Вставьте непустой фрагмент.")
+                    return
+                if not has_active_api_key():
+                    st.warning("Настройте API-ключ в «Настройках».")
+                    return
+                n = raw.count(needle)
+                if n != 1:
+                    st.error(f"Фрагмент должен встречаться ровно один раз (найдено: {n}).")
+                    return
+                theme = book.get("theme") or DEFAULT_THEME
+                temperature = float(book.get("temperature") or settings_manager.get("temperature", 0.4))
+                provider = get_llm_provider()
+                api_key = (
+                    get_deepseek_api_key()
+                    if provider == "deepseek"
+                    else get_gemini_api_key()
+                    if provider == "gemini"
+                    else get_api_key()
+                )
+                style = {
+                    "science": fs,
+                    "depth": fd,
+                    "accuracy": fa,
+                    "readability": fr,
+                    "source_quality": fsrc,
+                }
+                try:
+                    processor = TextProcessor(api_key, temperature=temperature, include_research=False)
+                    with st.spinner("Перефразирование фрагмента..."):
+                        new_part = processor.paraphrase_block(
+                            needle,
+                            theme,
+                            0,
+                            custom_prompt=frag_instr or "",
+                            style_controls=style,
+                        )
+                    new_text = raw.replace(needle, new_part, 1)
+                    update_book_paraphrased(
+                        book_id,
+                        new_text,
+                        change_note="Пересоздан фрагмент по запросу пользователя",
+                        created_by=username,
+                    )
+                    st.success("Фрагмент обновлён.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Ошибка: {e}")
+
+    def _render_paragraph_index_legend(self, edited_text: str) -> None:
+        blocks = _paragraph_blocks(edited_text)
+        if not blocks:
+            return
+        with st.expander("Список абзацев с номерами (для комментариев)", expanded=False):
+            st.caption("Выделение мышью в Streamlit недоступно — используйте номер абзаца.")
+            for i, b in enumerate(blocks[:80]):
+                preview = (b.replace("\n", " ")[:140] + "…") if len(b) > 140 else b.replace("\n", " ")
+                st.markdown(f"**{i + 1}.** {preview}")
+            if len(blocks) > 80:
+                st.caption(f"… и ещё {len(blocks) - 80} абзацев.")
+
+    def _render_admin_comments(self, book_id: int, edited_text: str = ""):
         """Блок комментариев модераторов (видимый администратору)."""
         st.subheader("Комментарии модераторов")
         comments = list_comments(book_id)
@@ -368,6 +552,7 @@ class BooksTab:
                 )
                 st.markdown(c.get("comment_text", ""))
                 st.markdown("---")
+        self._render_paragraph_index_legend(edited_text)
         with st.form(f"admin_comment_form_{book_id}", clear_on_submit=True):
             new_comment = st.text_area(
                 "Добавить комментарий (от администратора)",
@@ -379,6 +564,7 @@ class BooksTab:
                 min_value=0,
                 value=0,
                 step=1,
+                help="Номер абзаца — см. список выше.",
             )
             if st.form_submit_button("Добавить комментарий"):
                 if (new_comment or "").strip():

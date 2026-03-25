@@ -9,6 +9,7 @@ import streamlit as st
 
 from core.db import create_book, get_book, list_books
 from core.pdf_export import text_to_pdf
+from settings_manager import settings_manager
 
 OUTPUT_DIR = "output"
 PARAPHRASED_FILE = os.path.join(OUTPUT_DIR, "paraphrased.txt")
@@ -118,6 +119,13 @@ class ResultsTab:
                                 original_text=file_original or None,
                                 paraphrased_text=file_paraphrased,
                                 created_by=created_by,
+                                style_science=int(settings_manager.get("style_science", 3)),
+                                style_depth=int(settings_manager.get("style_depth", 3)),
+                                style_accuracy=int(settings_manager.get("style_accuracy", 3)),
+                                style_readability=int(settings_manager.get("style_readability", 3)),
+                                style_source_quality=int(
+                                    settings_manager.get("style_source_quality", 3)
+                                ),
                             )
                             st.session_state.last_saved_book_id = book_id
                             st.success(
